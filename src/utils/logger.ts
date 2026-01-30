@@ -6,8 +6,7 @@
 import * as winston from 'winston';
 import * as path from 'path';
 import * as fs from 'fs';
-
-export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'silent';
+import { LogLevel } from '../core/config/config.types';
 
 export interface LoggerOptions {
   level?: LogLevel;

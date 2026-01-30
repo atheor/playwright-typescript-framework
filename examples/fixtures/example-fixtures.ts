@@ -122,11 +122,15 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
 
   // Worker-scoped admin API client
   adminApiClient: [
-    async ({}, use) => {
+    async ({}, use: (r: ApiClient) => Promise<void>) => {
       const client = createApiClient();
+      // Initialize the Playwright API context
+      await client.initialize();
       // Set admin credentials
       client.setAuthToken(process.env.ADMIN_API_TOKEN ?? 'admin-token');
       await use(client);
+      // Dispose of the context after tests
+      await client.dispose();
     },
     { scope: 'worker' },
   ],

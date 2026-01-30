@@ -45,15 +45,19 @@ export interface WorkerFixtures {
  */
 export const test = base.extend<FrameworkFixtures, WorkerFixtures>({
   // API Client fixture
-  apiClient: async ({}, use) => {
+  apiClient: async ({}, use: (r: ApiClient) => Promise<void>) => {
     const client = createApiClient();
+    await client.initialize();
     await use(client);
+    await client.dispose();
   },
 
   // GraphQL Client fixture
-  graphqlClient: async ({}, use) => {
+  graphqlClient: async ({}, use: (r: GraphQLClient) => Promise<void>) => {
     const client = createGraphQLClient();
+    await client.initialize();
     await use(client);
+    await client.dispose();
   },
 
   // FTP Client fixture
@@ -82,17 +86,21 @@ export const test = base.extend<FrameworkFixtures, WorkerFixtures>({
   },
 
   // Authenticated API Client fixture
-  authenticatedApiClient: async ({}, use) => {
+  authenticatedApiClient: async ({}, use: (r: ApiClient) => Promise<void>) => {
     const client = createApiClient();
+    await client.initialize();
     // Override in test project to add authentication
     await use(client);
+    await client.dispose();
   },
 
   // Worker-scoped shared API client
   sharedApiClient: [
-    async ({}, use) => {
+    async ({}, use: (r: ApiClient) => Promise<void>) => {
       const client = createApiClient();
+      await client.initialize();
       await use(client);
+      await client.dispose();
     },
     { scope: 'worker' },
   ],

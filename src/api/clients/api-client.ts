@@ -1,14 +1,9 @@
 /**
  * Base API Client
- * Core HTTP client with built-in error handling, logging, and retry logic
+ * Core HTTP client using Playwright's APIRequestContext with built-in error handling, logging, and retry logic
  */
 
-import axios, {
-  AxiosInstance,
-  AxiosRequestConfig,
-  AxiosResponse,
-  InternalAxiosRequestConfig,
-} from 'axios';
+import { APIRequestContext, APIResponse, request } from '@playwright/test';
 import { FrameworkConfig } from '../../core/config';
 import {
   ApiRequestException,
@@ -35,17 +30,26 @@ export interface ApiClientOptions {
   retries?: number;
   /** Validate SSL certificates */
   validateSsl?: boolean;
+  /** HTTP credentials for basic auth */
+  httpCredentials?: {
+    username: string;
+    password: string;
+  };
+  /** Extra HTTP headers */
+  extraHTTPHeaders?: Record<string, string>;
 }
 
 /**
- * Base API Client with comprehensive features
+ * Base API Client using Playwright's APIRequestContext
  */
 export class ApiClient {
-  protected readonly client: AxiosInstance;
+  protected context: APIRequestContext | null = null;
   protected readonly logger: Logger;
-  protected readonly clientOptions: Required<ApiClientOptions>;
+  protected readonly clientOptions: Required<Omit<ApiClientOptions, 'httpCredentials' | 'extraHTTPHeaders'>> & 
+    Pick<ApiClientOptions, 'httpCredentials' | 'extraHTTPHeaders'>;
   private authToken?: string;
   private refreshTokenFn?: () => Promise<string>;
+  private initialized: boolean = false;
 
   constructor(options: ApiClientOptions = {}) {
     this.logger = Logger.getInstance();
@@ -61,77 +65,64 @@ export class ApiClient {
       enableLogging: options.enableLogging ?? apiConfig.enableLogging,
       retries: options.retries ?? retries.apiRequest,
       validateSsl: options.validateSsl ?? apiConfig.validateSsl,
+      httpCredentials: options.httpCredentials,
+      extraHTTPHeaders: options.extraHTTPHeaders,
     };
-
-    this.client = this.createClient();
-    this.setupInterceptors();
   }
 
   /**
-   * Create Axios instance
+   * Initialize the Playwright API context
+   * This must be called before making requests if not using a pre-existing context
    */
-  private createClient(): AxiosInstance {
-    return axios.create({
-      baseURL: this.clientOptions.baseUrl,
+  public async initialize(): Promise<void> {
+    if (this.initialized) return;
+
+    const headers = { ...this.clientOptions.headers };
+    if (this.authToken) {
+      headers['Authorization'] = `Bearer ${this.authToken}`;
+    }
+
+    // Ensure baseURL ends with a trailing slash for proper URL resolution
+    let baseUrl = this.clientOptions.baseUrl;
+    if (baseUrl && !baseUrl.endsWith('/')) {
+      baseUrl += '/';
+    }
+
+    this.context = await request.newContext({
+      baseURL: baseUrl,
+      extraHTTPHeaders: { ...headers, ...this.clientOptions.extraHTTPHeaders },
+      ignoreHTTPSErrors: !this.clientOptions.validateSsl,
       timeout: this.clientOptions.timeout,
-      headers: this.clientOptions.headers,
-      validateStatus: () => true, // Handle all status codes
+      httpCredentials: this.clientOptions.httpCredentials,
     });
+
+    this.initialized = true;
   }
 
   /**
-   * Setup request/response interceptors
+   * Set an existing Playwright APIRequestContext
    */
-  private setupInterceptors(): void {
-    // Request interceptor
-    this.client.interceptors.request.use(
-      (config: InternalAxiosRequestConfig) => {
-        // Add auth token if available
-        if (this.authToken && config.headers) {
-          config.headers.Authorization = `Bearer ${this.authToken}`;
-        }
+  public setContext(context: APIRequestContext): this {
+    this.context = context;
+    this.initialized = true;
+    return this;
+  }
 
-        // Log request
-        if (this.clientOptions.enableLogging) {
-          this.logger.debug(`API Request: ${config.method?.toUpperCase()} ${config.url}`, {
-            headers: config.headers,
-            data: config.data,
-          });
-        }
+  /**
+   * Get the underlying Playwright APIRequestContext
+   */
+  public getContext(): APIRequestContext | null {
+    return this.context;
+  }
 
-        return config;
-      },
-      (error) => {
-        this.logger.error('Request interceptor error', error as Error);
-        return Promise.reject(error);
-      }
-    );
-
-    // Response interceptor
-    this.client.interceptors.response.use(
-      (response: AxiosResponse) => {
-        if (this.clientOptions.enableLogging) {
-          this.logger.debug(`API Response: ${response.status} ${response.config.url}`, {
-            data: response.data,
-          });
-        }
-        return response;
-      },
-      async (error) => {
-        // Handle token refresh on 401
-        if (error.response?.status === 401 && this.refreshTokenFn) {
-          try {
-            this.authToken = await this.refreshTokenFn();
-            error.config.headers.Authorization = `Bearer ${this.authToken}`;
-            return this.client.request(error.config);
-          } catch (refreshError) {
-            this.logger.error('Token refresh failed', refreshError as Error);
-          }
-        }
-
-        return Promise.reject(error);
-      }
-    );
+  /**
+   * Ensure context is initialized
+   */
+  private async ensureContext(): Promise<APIRequestContext> {
+    if (!this.context) {
+      await this.initialize();
+    }
+    return this.context!;
   }
 
   /**
@@ -162,73 +153,177 @@ export class ApiClient {
    * Execute HTTP request with retry logic
    */
   public async request<T>(config: ApiRequestConfig): Promise<ApiResponse<T>> {
+    const context = await this.ensureContext();
     const startTime = Date.now();
     
-    const axiosConfig: AxiosRequestConfig = {
-      url: config.url,
-      method: config.method,
-      headers: config.headers,
-      params: config.params,
-      data: config.data,
-      timeout: config.timeout ?? this.clientOptions.timeout,
-      responseType: config.responseType ?? 'json',
+    const headers: Record<string, string> = {
+      ...this.clientOptions.headers,
+      ...config.headers,
     };
 
-    // Add auth
-    if (config.auth) {
-      axiosConfig.auth = config.auth;
+    // Add auth token
+    if (this.authToken) {
+      headers['Authorization'] = `Bearer ${this.authToken}`;
     }
     if (config.bearerToken) {
-      axiosConfig.headers = {
-        ...axiosConfig.headers,
-        Authorization: `Bearer ${config.bearerToken}`,
-      };
+      headers['Authorization'] = `Bearer ${config.bearerToken}`;
+    }
+
+    // Build URL with query params
+    // Strip leading slash from relative URLs for proper baseURL resolution
+    let url = config.url.startsWith('/') ? config.url.slice(1) : config.url;
+    if (config.params) {
+      const searchParams = new URLSearchParams();
+      Object.entries(config.params).forEach(([key, value]) => {
+        searchParams.append(key, String(value));
+      });
+      const queryString = searchParams.toString();
+      if (queryString) {
+        url += (url.includes('?') ? '&' : '?') + queryString;
+      }
     }
 
     const retryOptions: Partial<RetryOptions> = {
       maxAttempts: this.clientOptions.retries,
       retryCondition: (error: Error) => {
         // Retry on network errors or 5xx errors
-        const axiosError = error as { response?: { status: number } };
-        return !axiosError.response || axiosError.response.status >= 500;
+        const statusMatch = error.message.match(/status (\d+)/);
+        if (statusMatch) {
+          const status = parseInt(statusMatch[1], 10);
+          return status >= 500;
+        }
+        return true; // Retry on network errors
       },
       onRetry: (attempt, error) => {
         this.logger.warn(`Retrying API request (attempt ${attempt}): ${error.message}`);
       },
     };
 
+    // Log request
+    if (this.clientOptions.enableLogging) {
+      this.logger.debug(`API Request: ${config.method} ${url}`, {
+        headers,
+        data: config.data,
+      });
+    }
+
     try {
       const response = await retry(
-        () => this.client.request<T>(axiosConfig),
+        () => this.executeRequest(context, config.method, url, headers, config),
         retryOptions
       );
 
       const responseTime = Date.now() - startTime;
 
-      // Check for error status codes
-      if (response.status >= 400) {
-        this.handleErrorResponse(config, response);
+      // Parse response body
+      let data: T;
+      const contentType = response.headers()['content-type'] || '';
+      
+      if (config.responseType === 'arraybuffer') {
+        data = (await response.body()) as unknown as T;
+      } else if (config.responseType === 'text' || !contentType.includes('application/json')) {
+        data = (await response.text()) as unknown as T;
+      } else {
+        try {
+          data = await response.json();
+        } catch {
+          data = (await response.text()) as unknown as T;
+        }
+      }
+
+      // Log response
+      if (this.clientOptions.enableLogging) {
+        this.logger.debug(`API Response: ${response.status()} ${url}`, {
+          data,
+        });
+      }
+
+      // Only throw on error status codes if throwOnError is explicitly true
+      if (config.throwOnError && response.status() >= 400) {
+        await this.handleErrorResponse(config, response, data);
       }
 
       return {
-        data: response.data,
-        status: response.status,
-        statusText: response.statusText,
-        headers: response.headers as Record<string, string>,
+        data,
+        status: response.status(),
+        statusText: response.statusText(),
+        headers: response.headers() as Record<string, string>,
         config,
         responseTime,
       };
     } catch (error) {
+      // Re-throw our custom exceptions as-is
+      if (error instanceof ApiRequestException || 
+          error instanceof ApiAuthenticationException ||
+          error instanceof ApiTimeoutException) {
+        throw error;
+      }
+
+      // Handle token refresh on 401
+      if ((error as Error).message.includes('401') && this.refreshTokenFn) {
+        try {
+          this.authToken = await this.refreshTokenFn();
+          return this.request<T>(config);
+        } catch (refreshError) {
+          this.logger.error('Token refresh failed', refreshError as Error);
+        }
+      }
+
       this.handleRequestError(config, error as Error);
       throw error;
     }
   }
 
   /**
+   * Execute the actual request using Playwright's API
+   */
+  private async executeRequest(
+    context: APIRequestContext,
+    method: string,
+    url: string,
+    headers: Record<string, string>,
+    config: ApiRequestConfig
+  ): Promise<APIResponse> {
+    const requestOptions: Parameters<APIRequestContext['fetch']>[1] = {
+      headers,
+      timeout: config.timeout ?? this.clientOptions.timeout,
+      failOnStatusCode: false, // We handle status codes ourselves
+    };
+
+    // Add body for methods that support it
+    if (config.data !== undefined && ['POST', 'PUT', 'PATCH'].includes(method)) {
+      if (config.headers?.['Content-Type']?.includes('multipart/form-data')) {
+        // For multipart, data should be properly formatted
+        requestOptions.multipart = config.data as { [key: string]: string | number | boolean | { name: string; mimeType: string; buffer: Buffer } };
+      } else {
+        requestOptions.data = config.data;
+      }
+    }
+
+    // Add basic auth if provided
+    if (config.auth) {
+      const basicAuth = Buffer.from(`${config.auth.username}:${config.auth.password}`).toString('base64');
+      requestOptions.headers = {
+        ...requestOptions.headers,
+        'Authorization': `Basic ${basicAuth}`,
+      };
+    }
+
+    return context.fetch(url, {
+      method,
+      ...requestOptions,
+    });
+  }
+
+  /**
    * Handle error responses
    */
-  private handleErrorResponse(config: ApiRequestConfig, response: AxiosResponse): void {
-    if (response.status === 401) {
+  private async handleErrorResponse(
+    config: ApiRequestConfig,
+    response: APIResponse,
+    data: unknown
+  ): Promise<void> {
+    if (response.status() === 401) {
       throw new ApiAuthenticationException(
         config.url,
         'Unauthorized - invalid or expired credentials'
@@ -238,8 +333,8 @@ export class ApiClient {
     throw new ApiRequestException(
       config.method,
       config.url,
-      response.status,
-      response.data
+      response.status(),
+      data
     );
   }
 
@@ -247,7 +342,7 @@ export class ApiClient {
    * Handle request errors
    */
   private handleRequestError(config: ApiRequestConfig, error: Error): void {
-    if (error.message.includes('timeout')) {
+    if (error.message.includes('timeout') || error.message.includes('Timeout')) {
       throw new ApiTimeoutException(
         config.method,
         config.url,
@@ -333,7 +428,7 @@ export class ApiClient {
   }
 
   /**
-   * Upload file
+   * Upload file using Playwright's multipart support
    */
   public async uploadFile<T>(
     url: string,
@@ -341,32 +436,59 @@ export class ApiClient {
     fileName: string,
     additionalData?: Record<string, string>
   ): Promise<ApiResponse<T>> {
-    const formData = new FormData();
-    // Handle both Buffer and Blob types
-    const blob = file instanceof Blob ? file : new Blob([new Uint8Array(file)]);
-    formData.append('file', blob, fileName);
+    const context = await this.ensureContext();
+    const startTime = Date.now();
+
+    const headers: Record<string, string> = {
+      ...this.clientOptions.headers,
+    };
+
+    if (this.authToken) {
+      headers['Authorization'] = `Bearer ${this.authToken}`;
+    }
+
+    // Remove Content-Type to let Playwright set it for multipart
+    delete headers['Content-Type'];
+
+    const multipart: { [key: string]: string | number | boolean | { name: string; mimeType: string; buffer: Buffer } } = {
+      file: {
+        name: fileName,
+        mimeType: 'application/octet-stream',
+        buffer: file instanceof Blob ? Buffer.from(await file.arrayBuffer()) : file,
+      },
+    };
 
     if (additionalData) {
       Object.entries(additionalData).forEach(([key, value]) => {
-        formData.append(key, value);
+        multipart[key] = value;
       });
     }
 
-    return this.request<T>({
-      url,
+    const response = await context.fetch(url, {
       method: 'POST',
-      data: formData,
-      headers: {
-        'Content-Type': 'multipart/form-data',
-      },
+      headers,
+      multipart,
+      failOnStatusCode: false,
     });
+
+    const responseTime = Date.now() - startTime;
+    const data = await response.json() as T;
+
+    return {
+      data,
+      status: response.status(),
+      statusText: response.statusText(),
+      headers: response.headers() as Record<string, string>,
+      config: { url, method: 'POST' },
+      responseTime,
+    };
   }
 
   /**
    * Download file
    */
   public async downloadFile(url: string): Promise<Buffer> {
-    const response = await this.request<ArrayBuffer>({
+    const response = await this.request<Buffer>({
       url,
       method: 'GET',
       responseType: 'arraybuffer',
@@ -388,6 +510,17 @@ export class ApiClient {
       };
     } catch {
       return { healthy: false, responseTime: -1 };
+    }
+  }
+
+  /**
+   * Dispose the API context
+   */
+  public async dispose(): Promise<void> {
+    if (this.context) {
+      await this.context.dispose();
+      this.context = null;
+      this.initialized = false;
     }
   }
 }

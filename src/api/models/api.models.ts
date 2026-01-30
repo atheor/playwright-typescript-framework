@@ -35,6 +35,8 @@ export interface ApiRequestConfig {
   };
   /** Bearer token */
   bearerToken?: string;
+  /** Whether to throw an exception on 4xx/5xx responses (default: false) */
+  throwOnError?: boolean;
 }
 
 /**

@@ -13,16 +13,21 @@ import { ApiValidationException } from '../../core/exceptions';
 export type GraphQLVariables = Record<string, unknown>;
 
 /**
+ * GraphQL error format
+ */
+export interface GraphQLError {
+  message: string;
+  locations?: Array<{ line: number; column: number }>;
+  path?: string[];
+  extensions?: Record<string, unknown>;
+}
+
+/**
  * GraphQL response format
  */
 export interface GraphQLResponse<T> {
   data?: T;
-  errors?: Array<{
-    message: string;
-    locations?: Array<{ line: number; column: number }>;
-    path?: string[];
-    extensions?: Record<string, unknown>;
-  }>;
+  errors?: GraphQLError[];
 }
 
 /**
@@ -79,7 +84,7 @@ export class GraphQLClient extends ApiClient {
 
     // Check for GraphQL errors
     if (response.data.errors && response.data.errors.length > 0) {
-      const errorMessages = response.data.errors.map((e) => e.message);
+      const errorMessages = response.data.errors.map((e: GraphQLError) => e.message);
       throw new ApiValidationException(this.endpoint, errorMessages, response.data);
     }
 
